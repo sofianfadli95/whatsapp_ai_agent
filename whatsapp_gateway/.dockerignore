@@ -1,0 +1,9 @@
+node_modules
+dist
+auth_state
+.env
+*.log
+.git
+.DS_Store
+coverage
+.vitest

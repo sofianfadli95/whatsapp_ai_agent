@@ -157,9 +157,9 @@ flowchart LR
 
 #### Inbound WhatsApp message (happy path)
 
-1. WhatsApp Cloud API delivers `POST /webhooks/whatsapp`.
-2. `api/whatsapp.py` reads the raw body, verifies HMAC-SHA256 with `WHATSAPP_APP_SECRET`. On failure → 401, audit `signature_*`.
-3. The webhook handler parses the payload (Pydantic), normalizes the sender phone number to E.164, persists the inbound message (deduplicated by WhatsApp message id), and returns `200` within 5 seconds.
+1. The WhatsApp Gateway (Node.js + Baileys) receives a customer message and forwards it via `POST /internal/whatsapp/inbound` with `Authorization: Bearer <WHATSAPP_GATEWAY_INTERNAL_TOKEN>`.
+2. `api/whatsapp.py` verifies the bearer token (constant-time comparison) against `WHATSAPP_GATEWAY_INTERNAL_TOKEN`. On failure → 401, audit `auth_*`.
+3. The inbound handler parses the `InboundEvent` payload (Pydantic), normalizes the sender phone number to E.164, persists the inbound message (deduplicated by Baileys message id), and returns `200` within 5 seconds.
 4. The handler enqueues an in-process agent task for that conversation thread.
 5. The agent task: loads checkpoint via `PostgresSaver`, runs the LangGraph, commits checkpoint, enqueues an outbound reply task.
 6. The WhatsApp sender worker delivers the reply with retry/backoff, persists outbound status updates.
@@ -707,7 +707,7 @@ sequenceDiagram
     participant LW as LogisticsWorker
     participant LOG as LogisticsService
     participant W as WhatsApp Sender Worker
-    participant WA as WhatsApp Cloud API
+    participant WA_GW as WhatsApp Gateway (Baileys)
 
     PP->>API: POST /webhooks/payment (raw bytes + signature)
     API->>API: verify HMAC (PAYMENT_WEBHOOK_SECRET, ≤500ms)
@@ -747,7 +747,7 @@ sequenceDiagram
         LOG-->>LW: shipment(notification_already_sent=True)
     end
     Q->>W: WhatsAppSendTask
-    W->>WA: send tracking message (≤30s end-to-end)
+    W->>WA_GW: POST /send (Bearer token, ≤30s end-to-end)
 ```
 
 ---
@@ -795,16 +795,16 @@ Owned by LangGraph's `PostgresSaver`. We do not modify this schema directly; we 
 | --- | --- | --- |
 | `id` | UUID PK | |
 | `conversation_id` | UUID FK→conversations(id) NULL | Nullable because Req 2.2 rejects messages with invalid phone. |
-| `whatsapp_message_id` | TEXT NOT NULL | Idempotency key. |
+| `baileys_message_id` | TEXT NOT NULL | Idempotency key (Baileys `key.id`). |
 | `from_phone_raw` | TEXT NOT NULL | Pre-normalization. |
 | `from_phone_e164` | TEXT NULL | Post-normalization (NULL on invalid). |
 | `message_type` | TEXT NOT NULL | text/image/audio/video/document/sticker/location. |
 | `text_body` | TEXT NULL | |
-| `event_timestamp` | TIMESTAMPTZ NOT NULL | From WA payload. |
+| `event_timestamp` | TIMESTAMPTZ NOT NULL | From Baileys payload. |
 | `received_at` | TIMESTAMPTZ NOT NULL DEFAULT now() | |
 | `raw_payload` | JSONB NOT NULL | |
 
-Indexes: `UNIQUE(whatsapp_message_id)`, `INDEX(conversation_id, received_at)`.
+Indexes: `UNIQUE(baileys_message_id)`, `INDEX(conversation_id, received_at)`.
 
 ### `messages_outbound`
 
@@ -1128,7 +1128,7 @@ Legal transitions for Cart:
 
 | Key | Where it lives | Purpose | Requirement |
 | --- | --- | --- | --- |
-| `whatsapp_message_id` | `messages_inbound.whatsapp_message_id UNIQUE` | Inbound dedup | 1.7 |
+| `baileys_message_id` | `messages_inbound.baileys_message_id UNIQUE` | Inbound dedup | 1.6, 1.8 |
 | `webhook_event_id` | `payment_webhook_events.webhook_event_id UNIQUE` | Payment webhook dedup | 8.4, 8.5, 8.7 |
 | `(provider, provider_ref)` | `payments` UNIQUE | One Payment per provider id | 7, 8 |
 | `customer_confirmation_token` | derived in `OrderService` | Prevents stale-cart order creation | 6.3, 6.6 |
@@ -1141,62 +1141,50 @@ Legal transitions for Cart:
 
 ## Webhook Handling Subsystem
 
-### WhatsApp Webhook (`/webhooks/whatsapp`)
+### WhatsApp Inbound Channel (`/internal/whatsapp/inbound`)
 
-**GET (verification)**
-
-```python
-@router.get("/webhooks/whatsapp")
-async def verify(hub_mode: str = Query(..., alias="hub.mode"),
-                 hub_verify_token: str = Query(..., alias="hub.verify_token"),
-                 hub_challenge: str = Query(..., alias="hub.challenge")):
-    if hub_verify_token != settings.WHATSAPP_VERIFY_TOKEN:
-        return PlainTextResponse("forbidden", status_code=403)
-    return PlainTextResponse(hub_challenge, status_code=200)
-```
-
-**POST (events)**
+**POST (inbound events from the WhatsApp Gateway)**
 
 ```python
-@router.post("/webhooks/whatsapp")
+@router.post("/internal/whatsapp/inbound")
 async def receive(request: Request, audit: AuditLogger = Depends(...), conv: ConversationService = Depends(...), queue: WorkerQueue = Depends(...)):
-    raw = await request.body()                 # bytes; required for HMAC
-    if len(raw) > 1 * 1024 * 1024:             # Req 1.3
+    raw = await request.body()                 # bytes
+    if len(raw) > 1 * 1024 * 1024:             # body size cap 1 MB
         return PlainTextResponse("payload too large", status_code=413)
 
-    sig_check = verify_whatsapp_signature(raw, request.headers.get("X-Hub-Signature-256"), settings.WHATSAPP_APP_SECRET)
-    if not sig_check.ok:
-        await audit.signature_failure(source="whatsapp", reason=sig_check.reason, ip=request.client.host)
-        return PlainTextResponse("unauthorized", status_code=401)   # Req 1.5
+    # Bearer-token auth (constant-time comparison)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or not safe_compare(auth_header[7:], settings.WHATSAPP_GATEWAY_INTERNAL_TOKEN.get_secret_value()):
+        await audit.auth_failure(source="whatsapp_inbound", reason="invalid_bearer", ip=request.client.host)
+        return PlainTextResponse("unauthorized", status_code=401)
 
-    payload = WhatsAppWebhookPayload.model_validate_json(raw)        # Pydantic
-    for ev in payload.iter_message_events():
-        if ev.is_status_update():                                    # Req 1.12
-            await messages_repo.update_outbound_status(ev.message_id, ev.status, ev.status_at)
-            continue
-        # Inbound message
-        e164 = normalize_to_e164(ev.from_phone)
-        if e164 is None:
-            await audit.invalid_phone(raw_phone=ev.from_phone, message_id=ev.message_id)  # Req 2.2
-            continue
-        async with db.transaction():
-            inserted = await messages_repo.insert_inbound_idempotent(ev)         # Req 1.7 (UNIQUE(whatsapp_message_id))
-            if not inserted:
-                continue                                                          # already seen
-            customer = await conv.upsert_customer(e164)
-            conversation = await conv.get_or_create(customer.id)                  # Req 2.3
-        if ev.message_type != "text":                                             # Req 1.11
-            await queue.enqueue("non_text_reply", {"conversation_id": str(conversation.id), "message_id": ev.message_id})
-            continue
-        await queue.enqueue("agent_turn", {"conversation_id": str(conversation.id), "message_id": ev.message_id},
-                            dedupe_key=f"agent:{ev.message_id}")                  # Req 1.7
+    payload = InboundEvent.model_validate_json(raw)        # Pydantic
+    if payload.is_status_update():                         # Req 1.11 (status propagation)
+        await messages_repo.update_outbound_status(payload.baileys_message_id, payload.status, payload.status_at)
+        return Response(status_code=200)
+    # Inbound message
+    e164 = normalize_to_e164(payload.from_phone)
+    if e164 is None:
+        await audit.invalid_phone(raw_phone=payload.from_phone, message_id=payload.baileys_message_id)  # Req 2.2
+        return Response(status_code=200)
+    async with db.transaction():
+        inserted = await messages_repo.insert_inbound_idempotent(payload)   # Req 1.6 (UNIQUE(baileys_message_id))
+        if not inserted:
+            return Response(status_code=200)                                 # duplicate
+        customer = await conv.upsert_customer(e164)
+        conversation = await conv.get_or_create(customer.id)                # Req 2.3
+    if payload.message_type != "text":                                       # Req 1.11
+        await queue.enqueue("non_text_reply", {"conversation_id": str(conversation.id), "message_id": payload.baileys_message_id})
+        return Response(status_code=200)
+    await queue.enqueue("agent_turn", {"conversation_id": str(conversation.id), "message_id": payload.baileys_message_id},
+                        dedupe_key=f"agent:{payload.baileys_message_id}")   # Req 1.6
     return Response(status_code=200)
 ```
 
 **Outbound send semantics**
 
 ```python
-async def send_text(to_phone_e164: str, body: str) -> WhatsAppSendResult:
+async def send_text(to_phone_e164: str, body: str, idempotency_key: str) -> WhatsAppSendResult:
     # 4096-character chunking policy: split on whitespace boundaries, then enforce hard cap.
     chunks = chunk_for_whatsapp(body, max_len=4096)
     last_error: str | None = None
@@ -1204,9 +1192,11 @@ async def send_text(to_phone_e164: str, body: str) -> WhatsAppSendResult:
         for attempt, backoff in enumerate(EXPONENTIAL_BACKOFF, start=1):  # 1s, 2s, 4s capped at 8s, 3 attempts
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(WHATSAPP_GRAPH_URL.format(phone_number_id=settings.WHATSAPP_PHONE_NUMBER_ID),
-                                             json=build_text_payload(to_phone_e164, chunk),
-                                             headers={"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"})
+                    resp = await client.post(
+                        f"{settings.WHATSAPP_GATEWAY_URL}/send",
+                        json={"to": to_phone_e164, "body": chunk, "idempotency_key": idempotency_key},
+                        headers={"Authorization": f"Bearer {settings.WHATSAPP_GATEWAY_INTERNAL_TOKEN.get_secret_value()}"}
+                    )
                 if resp.is_success:
                     await messages_repo.record_sent(...)
                     break
@@ -1370,7 +1360,7 @@ For the MVP we run a single Cloud Run container that hosts both the FastAPI app 
 
 | Task | Dedupe key |
 | --- | --- |
-| `agent_turn` | `agent:{whatsapp_message_id}` (Req 1.7) |
+| `agent_turn` | `agent:{baileys_message_id}` (Req 1.6) |
 | `whatsapp_send` | `wa_send:{message_outbound_id}` |
 | `logistics_prepare` | `logistics:{order_id}` (Req 8.12, 9.5) |
 | `payment_confirmation_reply` | `pay_reply:{order_id}` (Req 8.12) |
@@ -1405,11 +1395,11 @@ class Settings(BaseSettings):
     # HTTP
     PORT: int = Field(default=8080, ge=1, le=65535)
 
-    # WhatsApp
-    WHATSAPP_VERIFY_TOKEN: SecretStr
-    WHATSAPP_APP_SECRET: SecretStr
-    WHATSAPP_PHONE_NUMBER_ID: str
-    WHATSAPP_ACCESS_TOKEN: SecretStr
+    # WhatsApp Gateway (Node.js + Baileys)
+    WHATSAPP_GATEWAY_URL: AnyHttpUrl                    # e.g. http://whatsapp_gateway:3001
+    WHATSAPP_GATEWAY_INTERNAL_TOKEN: SecretStr          # Bearer token for gateway ↔ backend auth
+    WHATSAPP_GATEWAY_AUTH_DIR: str = "/data/auth_state" # Baileys auth state directory (gateway side)
+    WHATSAPP_BACKEND_INBOUND_URL: AnyHttpUrl            # URL the gateway calls: .../internal/whatsapp/inbound
 
     # Payment
     PAYMENT_PROVIDER: str = "sandbox"
@@ -1434,6 +1424,8 @@ class Settings(BaseSettings):
         required = {"openai": self.OPENAI_API_KEY, "anthropic": self.ANTHROPIC_API_KEY, "google": self.GOOGLE_API_KEY}[provider]
         if required is None or not required.get_secret_value():
             raise StartupConfigError(f"Missing API key for LLM_PROVIDER={provider}")  # Req 12.4
+        if not self.WHATSAPP_GATEWAY_URL:
+            raise StartupConfigError("Missing WHATSAPP_GATEWAY_URL")
         return self
 ```
 
@@ -1585,11 +1577,11 @@ DATABASE_URL=postgresql+asyncpg://wa_agent:wa_agent@localhost:5432/wa_agent
 # Server
 PORT=8080
 
-# WhatsApp
-WHATSAPP_VERIFY_TOKEN=replace-me
-WHATSAPP_APP_SECRET=replace-me
-WHATSAPP_PHONE_NUMBER_ID=replace-me
-WHATSAPP_ACCESS_TOKEN=replace-me
+# WhatsApp Gateway (Node.js + Baileys)
+WHATSAPP_GATEWAY_URL=http://localhost:3001
+WHATSAPP_GATEWAY_INTERNAL_TOKEN=replace-me
+WHATSAPP_GATEWAY_AUTH_DIR=/data/auth_state
+WHATSAPP_BACKEND_INBOUND_URL=http://localhost:8080/internal/whatsapp/inbound
 
 # Payment
 PAYMENT_PROVIDER=sandbox
@@ -1693,20 +1685,20 @@ LIMIT $3;
 ```mermaid
 sequenceDiagram
     autonumber
-    participant WA as WhatsApp
-    participant API as /webhooks/whatsapp
+    participant WA_GW as WhatsApp Gateway (Baileys)
+    participant API as /internal/whatsapp/inbound
     participant DB as PostgreSQL
     participant Q as WorkerQueue
     participant AGT as LangGraph Agent
     participant RAG as RAGRetriever
     participant CAT as CatalogService
     participant W as WhatsAppSender
-    WA->>API: POST inbound text "ada moisturizer kulit berminyak?"
-    API->>API: HMAC verify (WHATSAPP_APP_SECRET)
-    API->>DB: INSERT messages_inbound (idempotent on whatsapp_message_id)
+    WA_GW->>API: POST inbound text "ada moisturizer kulit berminyak?" (Bearer token)
+    API->>API: verify Bearer token (WHATSAPP_GATEWAY_INTERNAL_TOKEN, constant-time)
+    API->>DB: INSERT messages_inbound (idempotent on baileys_message_id)
     API->>DB: get_or_create customer + conversation (E.164)
     API->>Q: enqueue agent_turn (dedupe=agent:msg_id)
-    API-->>WA: 200 OK (≤5s)
+    API-->>WA_GW: 200 OK (≤5s)
     Q->>AGT: invoke
     AGT->>DB: PostgresSaver.aget_tuple(thread=conv_id)
     AGT->>AGT: route_intent → inquiry
@@ -1720,7 +1712,7 @@ sequenceDiagram
     AGT->>DB: PostgresSaver.aput(state)
     AGT->>Q: enqueue whatsapp_send (4096-split)
     Q->>W: deliver
-    W->>WA: POST graph.facebook.com (≤10s, retry 1/2/4s, max 3)
+    W->>WA_GW: POST /send (Bearer token, ≤10s, retry 1/2/4s, max 3)
     W->>DB: UPDATE messages_outbound.status
 ```
 
@@ -1802,8 +1794,8 @@ sequenceDiagram
 
 | External call / boundary | Per-attempt timeout | Retry policy | Failure semantics |
 | --- | --- | --- | --- |
-| WhatsApp Cloud API send (`POST /messages`) | 10 s (Req 1.8) | 1 s → 2 s → 4 s capped 8 s, **max 3 attempts** (Req 1.9) | Persist `messages_outbound.status='failed'`, audit `outbound_send_failure`. No raise to webhook caller. |
-| WhatsApp Cloud API verify (`GET`) | n/a (no upstream) | n/a | Local equality check vs `WHATSAPP_VERIFY_TOKEN` (Req 1.1, 1.2). |
+| WhatsApp Gateway `POST /send` | 10 s (Req 1.9) | 1 s → 2 s → 4 s capped 8 s, **max 3 attempts** (Req 1.10) | Persist `messages_outbound.status='failed'`, audit `outbound_send_failure`. No raise to inbound handler. |
+| Inbound forwarder `POST /internal/whatsapp/inbound` (gateway→backend) | 10 s (gateway side, Req 1.5) | 1 s → 2 s → 4 s capped 8 s, **max 3 attempts** (Req 1.7); on exhaustion → on-disk overflow queue, re-attempted every 30 s | Gateway retries until backend is reachable; backend deduplicates by Baileys message id (Req 1.6). |
 | Payment provider create-link (`POST`) | 10 s (Req 7.2) | None for the synchronous tool call (we don't want to keep the agent waiting). Fail fast → `provider_unavailable`. | Order remains `pending_payment` (Req 7.5). |
 | Payment provider webhook signature verify | 500 ms (Req 8.2) | n/a | 401, no DB writes, audit `signature_*` (Req 8.3). |
 | Database transactions (services) | 5 s overall budget (Req 6.4, 8.6, 9.2) | Outer caller may retry once on serialization failure (`SQLSTATE 40001`). | Surface `ToolError("db_transient")`; consecutive failures count toward escalation. |
@@ -1838,23 +1830,23 @@ The agent never surfaces internal codes verbatim to the customer (Non-Negotiable
 
 The properties below are PBT-ready: each one is universally quantified, references the requirements it validates, and has an executable check defined in the Testing Strategy section. They follow the consolidation performed in the prework analysis (29 properties covering Requirements 1 through 12; smoke checks for Requirement 13 are listed in Testing Strategy).
 
-### Property 1: WhatsApp inbound HMAC gate
+### Property 1: WhatsApp inbound bearer-token auth gate
 
-*For any* request body and any header value that does not equal the HMAC-SHA256 of that body computed with `WHATSAPP_APP_SECRET`, the API SHALL respond with HTTP 401 and SHALL produce no `messages_inbound` row, no `conversations` row, and no enqueued `agent_turn` task as a result of that request.
+*For any* request to `POST /internal/whatsapp/inbound` whose `Authorization` header is missing, malformed, or whose bearer token does not equal `WHATSAPP_GATEWAY_INTERNAL_TOKEN` (verified with a constant-time comparison), the API SHALL respond with HTTP 401 and SHALL produce no `messages_inbound` row, no `conversations` row, and no enqueued `agent_turn` task as a result of that request.
 
-**Validates: Requirements 1.4, 1.5**
+**Validates: Requirements 1.8**
 
-### Property 2: WhatsApp inbound idempotency by `whatsapp_message_id`
+### Property 2: WhatsApp inbound idempotency by Baileys message id
 
-*For any* verified inbound message payload `M` delivered one or more times, after processing there SHALL be exactly one row in `messages_inbound` with `whatsapp_message_id == M.message_id`, exactly one outbound reply attempt enqueued for that message id, and (for status updates) exactly one update applied per `(message_id, status)` pair.
+*For any* verified inbound `InboundEvent` payload `M` delivered one or more times to `POST /internal/whatsapp/inbound`, after processing there SHALL be exactly one row in `messages_inbound` with `baileys_message_id == M.baileys_message_id`, exactly one outbound reply attempt enqueued for that message id, and (for status updates) exactly one update applied per `(message_id, status)` pair.
 
-**Validates: Requirements 1.6, 1.7, 1.10, 1.12**
+**Validates: Requirements 1.6, 1.8**
 
 ### Property 3: WhatsApp outbound send retry policy
 
-*For any* sequence of upstream WhatsApp send responses, the sender SHALL make at most 3 attempts with backoffs `[1s, 2s, 4s]` (capped at 8s for any future attempt), SHALL stop on the first successful attempt, SHALL persist a `messages_outbound` row reflecting the final `sent` or `failed` status, and SHALL NOT raise an unhandled error to the inbound webhook caller.
+*For any* sequence of upstream WhatsApp Gateway `POST /send` responses, the sender SHALL make at most 3 attempts with backoffs `[1s, 2s, 4s]` (capped at 8s for any future attempt), SHALL stop on the first successful attempt, SHALL persist a `messages_outbound` row reflecting the final `sent` or `failed` status, and SHALL NOT raise an unhandled error to the inbound handler.
 
-**Validates: Requirements 1.9**
+**Validates: Requirements 1.10**
 
 ### Property 4: Phone normalization idempotence and invalid rejection
 
@@ -2030,7 +2022,7 @@ All of the above SHALL hold within a single committed transaction, OR none SHALL
 
 - **Test runner**: `pytest` with `pytest-asyncio` for async tests, `pytest-cov` for coverage.
 - **Property-based testing**: `Hypothesis` for Python, configured with `max_examples=100` for property tests on pure functions, `max_examples=50` for property tests with database fixtures (slower), and per-test stateful machines for sequence-based properties (`hypothesis.stateful`).
-- **HTTP fakes**: `respx` for mocking `httpx` calls to WhatsApp Cloud API and Payment_Provider sandbox.
+- **HTTP fakes**: `respx` for mocking `httpx` calls to the WhatsApp Gateway (`POST /send`) and Payment_Provider sandbox.
 - **Database integration**: `testcontainers[postgres]` to spin up a real `pgvector/pgvector:pg16` container per test session, with per-test transactional rollback.
 - **LLM stubs**: a `FakeChatModel` injected via `LLMFactory` override for deterministic unit tests; structured-output paths are tested with hand-crafted classifier outputs.
 
@@ -2064,14 +2056,15 @@ This makes the requirement → design-property → test mapping fully traceable 
 The 29 properties from the Correctness Properties section each map to one Hypothesis property test (numbered `test_pNN_*`). Sketches:
 
 ```python
-# tests/properties/test_p01_whatsapp_hmac_gate.py
+# tests/properties/test_p01_whatsapp_bearer_gate.py
 from hypothesis import given, strategies as st
 
-@given(body=st.binary(min_size=0, max_size=8192), bad_header=st.text(max_size=128))
-async def test_p01_bad_signature_no_side_effects(http_client, db, body, bad_header):
-    """Feature: whatsapp-sales-agent-mvp, Property 1: WhatsApp inbound HMAC gate"""
-    resp = await http_client.post("/webhooks/whatsapp", content=body,
-                                  headers={"X-Hub-Signature-256": bad_header,
+@given(bad_token=st.text(max_size=128))
+async def test_p01_bad_bearer_no_side_effects(http_client, db, bad_token):
+    """Feature: whatsapp-sales-agent-mvp, Property 1: WhatsApp inbound bearer-token auth gate"""
+    resp = await http_client.post("/internal/whatsapp/inbound",
+                                  content=b'{"baileys_message_id":"test"}',
+                                  headers={"Authorization": f"Bearer {bad_token}",
                                            "Content-Type": "application/json"})
     assert resp.status_code == 401
     assert await db.scalar(select(func.count()).select_from(messages_inbound)) == 0
@@ -2148,7 +2141,7 @@ Categories:
 
 ### Test fakes for external providers
 
-- **`FakeWhatsAppClient`**: in-memory queue of outbound sends; configurable to inject HTTP errors, timeouts, or specific response codes; records every call for assertions.
+- **`FakeWhatsAppGateway`**: in-memory HTTP server stub that handles `POST /send` requests from the WhatsApp sender worker; configurable to inject HTTP errors, timeouts, or specific response codes; records every call for assertions.
 - **`FakePaymentProvider`** + **`PaymentSandboxHarness`**: deterministic payment-link creation; signs simulated webhook payloads with `PAYMENT_WEBHOOK_SECRET` so the signature verifier passes; supports replaying the same `webhook_event_id` to drive Property 19 tests.
 - **`FakeChatModel`**: implements LangChain's `BaseChatModel` interface. Returns scripted responses keyed by prompt fingerprint so deterministic tests of agent flow are stable.
 
@@ -2172,7 +2165,7 @@ Categories:
 
 | Req | Acceptance Criteria | Design Components | Properties |
 | --- | --- | --- | --- |
-| 1 WhatsApp webhook + reply | 1.1–1.12 | `api/whatsapp.py`, `utils/signature.py`, `workers/whatsapp_sender.py`, `messages_inbound`, `messages_outbound` | P1, P2, P3 |
+| 1 WhatsApp transport via Baileys Gateway | 1.1–1.12 | `api/whatsapp.py` (`POST /internal/whatsapp/inbound`), `workers/whatsapp_sender.py`, `repositories/messages.py`, `schemas/whatsapp.py`, `whatsapp_gateway/` (Node.js + Baileys microservice) | P1, P2, P3 |
 | 2 Conversation state + checkpointing | 2.1–2.10 | `agent/checkpointer.py`, `services/conversation.py`, `utils/phone.py`, `conversation_checkpoints` | P4, P5, P6 |
 | 3 Catalog Q&A + RAG | 3.1–3.11 | `services/catalog.py`, `vectorstore/retriever.py`, `tools/catalog.py`, `product_embeddings`, `faq_embeddings` | P7, P8, P9, P13 |
 | 4 Recommendation | 4.1–4.7 | `agent/nodes/recommend.py`, `tools/catalog.py::search_products` | P7, P8, P9 (subset), and the response-shape unit tests |

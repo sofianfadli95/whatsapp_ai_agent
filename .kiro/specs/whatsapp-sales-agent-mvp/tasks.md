@@ -90,7 +90,7 @@ flowchart TD
   - Depends on: none
   - Verification: getDiagnostics on requirements.md returns no errors; the file no longer contains references to `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, or `WHATSAPP_ACCESS_TOKEN`.
 
-- [-] 0.2 Amend design.md — architecture, sequence diagrams, settings, structure
+- [x] 0.2 Amend design.md — architecture, sequence diagrams, settings, structure
   - In the high-level architecture diagram, replace `WhatsApp Cloud API` with `WhatsApp Gateway (Node.js + Baileys)` and add the gateway as an external-process component reached over an internal HTTP channel.
   - Update the inbound and outbound sequence diagrams to route through the gateway; replace the HMAC verification step with bearer-token verification on `POST /internal/whatsapp/inbound`.
   - Replace the Settings (`app/config.py`) WhatsApp env vars with the Baileys gateway vars; update `.env.example` accordingly.
@@ -102,7 +102,7 @@ flowchart TD
   - Depends on: 0.1
   - Verification: getDiagnostics on design.md returns no errors; the high-level mermaid diagram includes a `WhatsApp Gateway` node; the `.env.example` snippet lists `WHATSAPP_GATEWAY_URL` and `WHATSAPP_GATEWAY_INTERNAL_TOKEN`.
 
-- [~] 0.3 Validate amended docs and update the design correctness properties touching WhatsApp
+- [x] 0.3 Validate amended docs and update the design correctness properties touching WhatsApp
   - Re-read Properties 1, 2, 3 in the design.md Correctness Properties section and rewrite them to refer to the gateway-based authentication and idempotency keys (Baileys message id remains the inbound dedupe key; the gateway internal bearer token replaces HMAC).
   - Requirements: post-amendment Req 1
   - Design: Correctness Properties section
@@ -111,7 +111,7 @@ flowchart TD
 
 ### Phase 1: WhatsApp Gateway Microservice (Node.js + Baileys) — User Priority
 
-- [ ] 1.1 Initialize the gateway project under `whatsapp_gateway/`
+- [x] 1.1 Initialize the gateway project under `whatsapp_gateway/`
   - `package.json` with TypeScript, ESLint, Prettier; `tsconfig.json` (target ES2022, module NodeNext); `pnpm` or `npm` lockfile committed.
   - Add scripts: `dev` (tsx watch), `build` (tsc), `start` (node dist/index.js), `lint`, `test`.
   - Requirements: post-amendment Req 1
@@ -119,7 +119,7 @@ flowchart TD
   - Depends on: 0.2
   - Verification: `pnpm install && pnpm build` succeeds; `pnpm lint` reports no errors on the empty skeleton.
 
-- [ ] 1.2 Add Baileys and supporting dependencies
+- [x] 1.2 Add Baileys and supporting dependencies
   - Runtime: `@whiskeysockets/baileys`, `fastify` (or `express`), `pino`, `pino-pretty` (dev), `zod`, `dotenv`, `axios`, `qrcode`.
   - Dev: `@types/node`, `typescript`, `tsx`, `eslint`, `prettier`, `vitest`, `@types/qrcode`.
   - Requirements: post-amendment Req 1
@@ -127,7 +127,7 @@ flowchart TD
   - Depends on: 1.1
   - Verification: `pnpm install` succeeds; lockfile pins exact Baileys version.
 
-- [ ] 1.3 Implement Baileys session bootstrap
+- [x] 1.3 Implement Baileys session bootstrap
   - File: `src/baileys/session.ts`. Use `useMultiFileAuthState(WHATSAPP_GATEWAY_AUTH_DIR)` for persisted auth.
   - Create the Baileys socket; subscribe to `connection.update` events; handle `lastDisconnect.error?.output?.statusCode` to determine whether to reconnect (and not on `loggedOut`).
   - Expose a `SessionManager` singleton with `getSocket()`, `isConnected()`, and `currentQR()`.
@@ -136,7 +136,7 @@ flowchart TD
   - Depends on: 1.2
   - Verification: unit test using a fake transport asserts `SessionManager` recreates its socket after a simulated disconnect that is not `loggedOut`, and exits cleanly when `loggedOut` is observed.
 
-- [ ] 1.4 Implement `GET /qr` endpoint
+- [x] 1.4 Implement `GET /qr` endpoint
   - Returns the latest QR code as a JSON `{ "qr_data_url": "data:image/png;base64,..." }` when paired pending, or `{ "status": "connected" }` when paired.
   - Gated by `WHATSAPP_GATEWAY_INTERNAL_TOKEN` bearer auth.
   - Requirements: post-amendment Req 1 (QR pairing)
@@ -144,7 +144,7 @@ flowchart TD
   - Depends on: 1.3
   - Verification: integration test with a fake session returns 200 with a non-empty `qr_data_url` when the session is in QR-pending state, and 401 when the bearer token is missing/wrong.
 
-- [ ] 1.5 Implement `messages.upsert` event handler
+- [x] 1.5 Implement `messages.upsert` event handler
   - File: `src/baileys/inbound.ts`. Subscribe to `sock.ev.on("messages.upsert", handler)`.
   - For each message: filter `key.fromMe === false`; extract Baileys message id (`key.id`), JID, normalize to E.164 (`src/utils/phone.ts`), classify message type (text vs media vs status), build an `InboundEvent` Zod-validated payload.
   - Dedupe by `(key.remoteJid, key.id)` in a small bounded LRU to absorb intra-process retries.
@@ -154,7 +154,7 @@ flowchart TD
   - Depends on: 1.3
   - Verification: unit test feeds two upsert events with the same `(remoteJid, id)` and asserts only one `InboundEvent` is forwarded.
 
-- [ ] 1.6 Implement `POST /send` endpoint
+- [x] 1.6 Implement `POST /send` endpoint
   - Body: `{ to: string (E.164), body: string, idempotency_key: string }` (zod-validated).
   - Calls `sock.sendMessage(jid, { text: body })` with a 10s timeout (axios/abort-controller pattern around the Baileys promise).
   - Returns 200 `{ status: "sent", message_id }` on success, 504 `{ status: "timeout" }` on timeout, 503 `{ status: "not_connected" }` if Baileys socket is not connected, 502 `{ status: "send_failed", error_code }` on Baileys errors.
@@ -164,7 +164,7 @@ flowchart TD
   - Depends on: 1.3, 1.8
   - Verification: integration test asserts (a) successful send returns 200 with a `message_id`, (b) duplicate idempotency_key replays return the same response, (c) socket-disconnected state returns 503.
 
-- [ ] 1.7 Implement `GET /healthz` and `GET /readyz`
+- [x] 1.7 Implement `GET /healthz` and `GET /readyz`
   - `/healthz`: returns 200 immediately, no dependency checks.
   - `/readyz`: returns 200 only when `SessionManager.isConnected()` is true; otherwise 503 with `{ "status": "not_connected" }`.
   - Requirements: post-amendment Req 1 (gateway health), Req 12.6, 12.7
@@ -172,7 +172,7 @@ flowchart TD
   - Depends on: 1.3
   - Verification: integration tests cover both connected and disconnected states.
 
-- [ ] 1.8 Implement internal authentication middleware
+- [x] 1.8 Implement internal authentication middleware
   - Bearer-token middleware that verifies `Authorization: Bearer <WHATSAPP_GATEWAY_INTERNAL_TOKEN>` on `POST /send` and on `GET /qr`. Constant-time string comparison.
   - The inbound forwarder (Task 1.9) attaches the same bearer token when calling the Python backend.
   - Requirements: post-amendment Req 1 (internal auth replaces Meta HMAC)
@@ -180,7 +180,7 @@ flowchart TD
   - Depends on: 1.2
   - Verification: 401 returned when token is missing/incorrect; 200 when correct; constant-time comparison verified by a unit test on `safeCompare()`.
 
-- [ ] 1.9 Implement inbound forwarder with retries and overflow queue
+- [x] 1.9 Implement inbound forwarder with retries and overflow queue
   - File: `src/forwarder/forwarder.ts`. POSTs each `InboundEvent` to `WHATSAPP_BACKEND_INBOUND_URL` with `Authorization: Bearer <WHATSAPP_GATEWAY_INTERNAL_TOKEN>` and 10s timeout.
   - Retry policy: 1s/2s/4s, capped 8s, max 3 attempts.
   - On exhausted retries, persist to an on-disk overflow queue (newline-delimited JSON in `WHATSAPP_GATEWAY_AUTH_DIR/outbox/`); a background scanner re-attempts overflow events every 30s while the backend is reachable.
@@ -189,7 +189,7 @@ flowchart TD
   - Depends on: 1.5, 1.8
   - Verification: integration test simulates backend 500 for 3 attempts and asserts the event is written to the overflow queue and re-attempted on backend recovery.
 
-- [ ] 1.10 Implement structured logging and a small metrics endpoint
+- [x] 1.10 Implement structured logging and a small metrics endpoint
   - pino JSON logging with request id correlation; log fields include `event_id`, `gateway_action`, `to_phone`, `status`.
   - `GET /metrics` exposes counters: inbound forwarded, inbound failed, outbound sent, outbound failed, queue depth.
   - Requirements: Req 11 (auditability of operational events on the gateway side)
@@ -197,21 +197,21 @@ flowchart TD
   - Depends on: 1.5, 1.6, 1.9
   - Verification: a smoke run exposes non-zero counters after one successful send and one inbound forward.
 
-- [ ] 1.11 Multi-stage Dockerfile for the gateway
+- [x] 1.11 Multi-stage Dockerfile for the gateway
   - Node 20 alpine, two stages (deps build vs runtime), runs as non-root, exposes `PORT` (default 3001), volume mount point for `/data/auth_state`.
   - Requirements: post-amendment Req 1
   - Design: Configuration and Deployment
   - Depends on: 1.1
   - Verification: `docker build whatsapp_gateway/` succeeds; the built image starts and `/healthz` answers within 30s.
 
-- [ ] 1.12 docker-compose.yml entry for the gateway
+- [x] 1.12 docker-compose.yml entry for the gateway
   - Service `whatsapp_gateway` with `WHATSAPP_GATEWAY_AUTH_DIR=/data/auth_state`, named volume `wa_gateway_state:/data/auth_state` for session persistence across restarts; exposes port 3001 to the api service network.
   - Requirements: post-amendment Req 1, Req 13.6 (local dev)
   - Design: Configuration and Deployment
   - Depends on: 1.11
   - Verification: `docker compose up -d whatsapp_gateway` brings the container to healthy status; restarting the container preserves the auth_state volume.
 
-- [ ] 1.13 Unit tests for the gateway
+- [x] 1.13 Unit tests for the gateway
   - `src/utils/phone.spec.ts`: idempotence and invalid-rejection (mirrors Property 4).
   - `src/baileys/inbound.spec.ts`: dedupe by `(remoteJid, id)`.
   - `src/forwarder/forwarder.spec.ts`: retry/backoff, overflow on exhaustion.
@@ -221,7 +221,7 @@ flowchart TD
   - Depends on: 1.5, 1.6, 1.8, 1.9
   - Verification: `pnpm test` passes locally and in CI; coverage on these files ≥ 90%.
 
-- [ ] 1.14 Integration test against a Baileys mock
+- [x] 1.14 Integration test against a Baileys mock
   - Use a `FakeBaileysSocket` (in-memory event emitter implementing the Baileys interfaces used by `SessionManager` and `inbound.ts`).
   - Scenarios: (a) inbound text message → forwarded to a fake backend HTTP server, (b) outbound `POST /send` → `FakeBaileysSocket.sendMessage` invoked once, (c) backend down → overflow queue, (d) socket reconnect cycle.
   - Requirements: post-amendment Req 1
@@ -229,7 +229,7 @@ flowchart TD
   - Depends on: 1.5, 1.6, 1.9
   - Verification: `pnpm test:integration` runs the full scenario suite; CI does not require a real WhatsApp connection.
 
-- [ ] 1.15 Gateway README
+- [x] 1.15 Gateway README
   - `whatsapp_gateway/README.md`: prerequisites, install, env vars, how to scan QR (`curl /qr` with bearer token, render the data URL), how to run via docker compose, how to back up auth_state, how to log out and re-pair.
   - Requirements: post-amendment Req 1, Req 13.7
   - Design: Local Development with uv (cross-references)
@@ -238,7 +238,7 @@ flowchart TD
 
 ### Phase 2: Python Backend Bootstrap
 
-- [ ] 2.1 Initialize Python project with uv
+- [x] 2.1 Initialize Python project with uv
   - `pyproject.toml` (Python `>=3.11`), runtime and dev dependency groups as listed in design.md (FastAPI, uvicorn, pydantic, pydantic-settings, SQLAlchemy[asyncio], asyncpg, alembic, pgvector, httpx, phonenumbers, structlog, langchain, langgraph, langgraph-checkpoint-postgres, langchain-openai, langchain-anthropic, langchain-google-genai, tenacity, python-multipart; dev: pytest, pytest-asyncio, pytest-cov, hypothesis, ruff, mypy, respx, testcontainers[postgres]).
   - Generate `uv.lock` via `uv sync`.
   - Requirements: Req 13.1, 13.2, 13.3
@@ -246,14 +246,14 @@ flowchart TD
   - Depends on: 0.2
   - Verification: `uv sync --frozen` exits 0 on a clean checkout in under 600s.
 
-- [ ] 2.2 Create the directory layout per steering/structure.md
+- [x] 2.2 Create the directory layout per steering/structure.md
   - `app/api`, `app/agent` (with `nodes/`, `prompts/`), `app/tools`, `app/services`, `app/repositories`, `app/db` (with `migrations/`), `app/vectorstore`, `app/workers`, `app/schemas`, `app/observability`, `app/utils`, `mcp_servers/`, `tests/{unit,properties,integration,smoke}`, `scripts/`, `docs/`, `infra/`. Each package has an `__init__.py`.
   - Requirements: Req 13.7
   - Design: Project Structure
   - Depends on: 2.1
   - Verification: `tree -L 2 app` matches the structure in design.md.
 
-- [ ] 2.3 Implement `app/config.py` with Pydantic Settings and fail-fast validation
+- [x] 2.3 Implement `app/config.py` with Pydantic Settings and fail-fast validation
   - All env vars from the amended design.md, including `WHATSAPP_GATEWAY_URL`, `WHATSAPP_GATEWAY_INTERNAL_TOKEN`, `WHATSAPP_BACKEND_INBOUND_URL` (used by gateway, surfaced for documentation), `LLM_PROVIDER`, `LLM_MODEL`, provider credentials, `DATABASE_URL`, `PORT`, `PAYMENT_*`, `RAG_*`, `ESCALATION_CONFIDENCE_THRESHOLD`, `EMBEDDING_MODEL`.
   - `model_validator(mode="after")` raises `StartupConfigError` when (a) `LLM_PROVIDER` is invalid, (b) the matching credential is missing/empty, (c) `LLM_MODEL` is empty, (d) `PORT` is out of range, or (e) the gateway URL is missing.
   - Requirements: Req 12.1, 12.2, 12.3, 12.4, 12.10, 12.11
@@ -261,7 +261,7 @@ flowchart TD
   - Depends on: 2.2
   - Verification: unit tests cover each invalid-config branch; the app exits non-zero before binding any port when invalid.
 
-- [ ] 2.4 Implement `app/main.py` FastAPI app factory
+- [x] 2.4 Implement `app/main.py` FastAPI app factory
   - Lifespan that: validates `Settings`, initializes the DB engine + session factory, initializes the LangGraph PostgresSaver, starts in-process workers, and on shutdown drains them with a 10s budget.
   - Wires all routers; sets up structured logging middleware that injects `request_id` into context.
   - Requirements: Req 12.6, 12.7, 12.9, 12.10, 13.9
@@ -269,14 +269,14 @@ flowchart TD
   - Depends on: 2.3
   - Verification: `uv run uvicorn app.main:app --port 8080` starts within 30s and answers `/healthz` with 200 in under 1s.
 
-- [ ] 2.5 Observability scaffolding
+- [x] 2.5 Observability scaffolding
   - `app/observability/logging.py` (structlog with JSON renderer, request-id binder, redaction processor), `tracing.py` (OpenTelemetry FastAPI/asyncpg/httpx instrumentation, OTLP exporter via env), `metrics.py` (Prometheus-style counters; expose `/metrics` later if desired).
   - Requirements: Req 11.8 (redaction)
   - Design: Observability Layer, Property 26
   - Depends on: 2.2
   - Verification: log lines from a unit-tested handler include `request_id`, `conversation_id` when set, and never contain credential-like substrings.
 
-- [ ] 2.6 Implement `/healthz` and `/readyz`
+- [x] 2.6 Implement `/healthz` and `/readyz`
   - `app/api/health.py`. `/healthz` returns `{status:"ok", ts:...}` in under 1s with no DB I/O. `/readyz` runs a `SELECT 1` and a checkpointer reachability probe with `asyncio.wait_for`; returns 503 with `{status:"not_ready", dependency:"db"|"checkpointer"}` on failure.
   - Requirements: Req 12.6, 12.7, 12.8
   - Design: Configuration and Deployment, Property 29
@@ -285,35 +285,35 @@ flowchart TD
 
 ### Phase 3: Database, Migrations, Seed
 
-- [ ] 3.1 SQLAlchemy 2.0 async engine and session factory
+- [x] 3.1 SQLAlchemy 2.0 async engine and session factory
   - `app/db/session.py`: `create_async_engine(DATABASE_URL, pool_pre_ping=True)`, `async_sessionmaker(expire_on_commit=False)`, request-scoped `get_session` dependency.
   - Requirements: Req 13.7
   - Design: Repositories Layer
   - Depends on: 2.4
   - Verification: a unit test obtains a session and runs `SELECT 1`.
 
-- [ ] 3.2 SQLAlchemy models for all design tables
+- [x] 3.2 SQLAlchemy models for all design tables
   - `app/db/models.py`: `customers`, `conversations`, `messages_inbound`, `messages_outbound`, `products`, `product_variants`, `product_embeddings`, `faq_documents`, `faq_embeddings`, `carts`, `cart_items`, `orders`, `order_items`, `payments`, `payment_webhook_events`, `shipments`, `dispatched_actions`, `audit_logs`, `audit_log_failures`, `escalations`, `admin_users`. Constraints, indexes, partial unique indexes (active OPEN cart per customer), and CHECKs as in the design.
   - Requirements: Reqs 1, 2, 3, 5, 6, 7, 8, 9, 10, 11
   - Design: Data Models
   - Depends on: 3.1
   - Verification: `mypy` passes; `Base.metadata` reflects the expected DDL; round-trip insert/select on each model in unit tests.
 
-- [ ] 3.3 Alembic setup and initial migration
+- [x] 3.3 Alembic setup and initial migration
   - `app/db/migrations/` with `env.py` configured for async, `alembic.ini` at repo root, initial migration `0001_init.py` that runs `CREATE EXTENSION IF NOT EXISTS vector`, creates all tables, adds CHECKs, partial unique indexes, pgvector indexes (HNSW or IVFFlat) on `product_embeddings.embedding` and `faq_embeddings.embedding`.
   - Requirements: Req 12.13, Req 13.6
   - Design: Data Models
   - Depends on: 3.2
   - Verification: `uv run alembic upgrade head` against a fresh `pgvector/pgvector:pg16` container completes without errors; `uv run alembic downgrade -1 && upgrade head` is idempotent.
 
-- [ ] 3.4 Repositories (narrow async functions; services own transactions)
+- [x] 3.4 Repositories (narrow async functions; services own transactions)
   - One module per primary aggregate in `app/repositories/`. Examples: `customers.upsert(phone_e164)`, `messages.insert_inbound_idempotent(...)`, `webhook_events.try_insert(webhook_event_id, payment_id, raw_payload)`, `dispatched_actions.try_dispatch(order_id, action_type)`. Repositories accept an `AsyncSession` or `AsyncConnection` argument and never `commit()`.
   - Requirements: Reqs 1, 5, 6, 7, 8, 9, 10, 11
   - Design: Repositories Layer
   - Depends on: 3.2
   - Verification: each repo function has at least one unit test with a transactional rollback fixture.
 
-- [ ] 3.5 `scripts/migrate_and_seed.py`
+- [x] 3.5 `scripts/migrate_and_seed.py`
   - Steps: (a) `alembic upgrade head`; (b) ensure pgvector extension; (c) seed ≥5 products with ≥1 variant each (idempotent via `INSERT ... ON CONFLICT (variant_sku) DO NOTHING`); (d) seed ≥5 FAQ documents (idempotent); (e) compute and upsert embeddings for any product/FAQ row updated since last run (Phase 8 wires the embedding generator).
   - Idempotent: a second run produces no new rows and is detectable from row counts.
   - Requirements: Req 13.5, 13.6, 13.7, 13.8
@@ -321,7 +321,7 @@ flowchart TD
   - Depends on: 3.3, 3.4, 8.2
   - Verification: running the script twice yields identical `SELECT count(*)` from `products` and `faq_documents`; failure modes (DB unreachable, mid-step error) cause non-zero exit with descriptive log line.
 
-- [ ] 3.6 docker-compose entry for `pgvector/pgvector:pg16`
+- [x] 3.6 docker-compose entry for `pgvector/pgvector:pg16`
   - Service `postgres` with healthcheck (`pg_isready`), named volume `pgdata`, exposed on `5432`.
   - Requirements: Req 12.13, Req 13.6
   - Design: Configuration and Deployment
@@ -345,21 +345,21 @@ flowchart TD
   - Depends on: 2.6, 3.4, 4.1, 7.1
   - Verification: integration tests cover happy path (inserts inbound + enqueues task), duplicate (no second insert, no second enqueue), invalid bearer (401), invalid phone (audit + skip), and non-text message branches.
 
-- [ ] 4.3 Outbound sender worker (`app/workers/whatsapp_sender.py`)
+- [x] 4.3 Outbound sender worker (`app/workers/whatsapp_sender.py`)
   - Consumes `whatsapp_send` tasks from the in-process queue; calls `POST {WHATSAPP_GATEWAY_URL}/send` with bearer auth, 10s timeout per attempt, retry budget 1s/2s/4s capped 8s, max 3 attempts; chunking for bodies over 4096 chars; updates `messages_outbound.status` and `attempts`; on terminal failure persists `failed` status and emits an audit record `outbound_send_failure`.
   - Requirements: post-amendment Req 1
   - Design: Webhook Handling Subsystem (post-amendment), Property 3
   - Depends on: 4.1, 7.1, 7.3
   - Verification: integration test with a stubbed gateway server asserts (a) one send returns `sent`, (b) a server returning 500 thrice ends in `failed` with attempts=3 and an audit row.
 
-- [ ] 4.4 Phone normalization utility
+- [x] 4.4 Phone normalization utility
   - `app/utils/phone.py::normalize_to_e164(raw)` using the `phonenumbers` library; returns `None` on invalid; idempotent for valid inputs.
   - Requirements: Req 2.1, 2.2
   - Design: Utilities Layer, Property 4
   - Depends on: 2.2
   - Verification: Hypothesis property test asserts idempotence and the rejection-on-invalid invariant.
 
-- [ ] 4.5 Property tests for the bridge
+- [x] 4.5 Property tests for the bridge
   - `tests/properties/test_p01_internal_inbound_auth_gate.py` (Property 1, post-amendment: bearer-token gating produces no DB writes on bad token).
   - `tests/properties/test_p02_inbound_idempotency.py` (Property 2: replays of the same Baileys message id yield exactly one inbound row and one enqueued task).
   - `tests/properties/test_p03_outbound_retry_policy.py` (Property 3: backoff sequence and bounded attempts).
@@ -371,7 +371,7 @@ flowchart TD
 
 ### Phase 5: LangGraph Agent and Tools
 
-- [ ] 5.1 LLM_Factory
+- [x] 5.1 LLM_Factory
   - `app/agent/llm_factory.py`: `build_llm_factory(settings)` returns a singleton factory exposing `get_chat_model(temperature, max_tokens)`. Provider selection on `settings.LLM_PROVIDER`. Validates the matching credential env var.
   - AST/lint rule (`scripts/check_no_provider_imports.py`) ensures `app/agent/**` does not import `langchain_openai|langchain_anthropic|langchain_google_genai` directly.
   - Requirements: Req 12.1, 12.2, 12.3, 12.4, 12.5
@@ -379,21 +379,21 @@ flowchart TD
   - Depends on: 2.3
   - Verification: unit test exercises each provider branch; a separate test runs the AST check and asserts a clean tree.
 
-- [ ] 5.2 ConversationState TypedDict
+- [x] 5.2 ConversationState TypedDict
   - `app/agent/state.py` matching the design (identity fields, message thread reducer, intent + confidence, RAG snippets, working refs, escalation tracking, tool_errors, reply_text/reply_enqueued).
   - Requirements: Req 2, Req 10
   - Design: ConversationState TypedDict
   - Depends on: 2.2
   - Verification: type check passes; serializing the empty state to JSON for checkpointing succeeds.
 
-- [ ] 5.3 PostgresSaver checkpointer wiring
+- [x] 5.3 PostgresSaver checkpointer wiring
   - `app/agent/checkpointer.py`: build `PostgresSaver` over the same async connection pool. `thread_id` derived from `conversation_id`. Wrap load/commit calls with 5s timeouts; on failure, set the escalation flag transactionally before any audit write, and surface a non-success response to the inbound handler.
   - Requirements: Req 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10
   - Design: Components and Interfaces — Agent Layer, Properties 5, 6
   - Depends on: 3.3, 5.2
   - Verification: integration test simulates a checkpoint load failure and asserts the escalation flag is set, the audit record is written after, and no outbound reply is enqueued.
 
-- [ ] 5.4 LangGraph nodes
+- [x] 5.4 LangGraph nodes
   - `app/agent/nodes/`: `route_intent.py` (LLM with structured-output classifier producing `intent` + `intent_confidence`), `retrieve_rag.py`, `search_catalog.py`, `recommend.py`, `manage_cart.py`, `request_confirmation.py` (computes `customer_confirmation_token`), `create_order.py`, `create_payment_link.py`, `escalate.py`, `send_reply.py` (enqueues `whatsapp_send`, never blocks on outbound IO).
   - Edge logic: 2 consecutive RAG misses or 2 consecutive catalog tool failures route to `escalate`; confidence below `ESCALATION_CONFIDENCE_THRESHOLD` routes to `escalate` with the candidate reply suppressed.
   - Requirements: Reqs 3, 4, 5, 6, 7, 10
@@ -401,7 +401,7 @@ flowchart TD
   - Depends on: 5.3, 6.1, 6.5, 6.7
   - Verification: unit tests with FakeChatModel exercise each branching condition and assert the resulting `ConversationState`.
 
-- [ ] 5.5 Tool definitions
+- [x] 5.5 Tool definitions
   - `app/tools/catalog.py`: `search_products`, `add_to_cart`, `update_cart_item_quantity`, `remove_from_cart`, `get_cart`. Pydantic input/output schemas; uniform `ToolResult` envelope; per-tool `asyncio.wait_for` timeout per design.
   - `app/tools/order.py::create_order`, `app/tools/payment.py::create_payment_link`, `app/tools/support.py::escalate_to_human`.
   - `prepare_shipment` is intentionally NOT a LangChain tool.
@@ -411,7 +411,7 @@ flowchart TD
   - Depends on: 6.1, 6.5, 6.7, 7.3
   - Verification: schema-validation unit tests reject malformed inputs without contacting any service; an audit-exactly-once unit test checks one record per call.
 
-- [ ] 5.6 Property tests for the agent
+- [x] 5.6 Property tests for the agent
   - `tests/properties/test_p07_rag_bounds.py` (Property 7, RAG_TOP_K and threshold honoured), `test_p08_consecutive_failure_escalation.py` (Property 8), `test_p24_escalation_suppresses_replies.py` (Property 24).
   - Requirements: Reqs 3, 8, 10
   - Design: Properties 7, 8, 24

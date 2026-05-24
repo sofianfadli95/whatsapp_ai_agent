@@ -1,0 +1,7 @@
+allowBuilds:
+  '@whiskeysockets/baileys': true
+  esbuild: false
+  protobufjs: true
+  sharp: true
+minimumReleaseAgeExclude:
+  - '@whiskeysockets/baileys@7.0.0-rc13'

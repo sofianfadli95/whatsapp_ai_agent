@@ -1,3 +1,16 @@
+# Node / WhatsApp Gateway
+node_modules/
+whatsapp_gateway/dist/
+whatsapp_gateway/node_modules/
+*.tsbuildinfo
+
+# pnpm
+.pnpm-store/
+
+# WhatsApp auth state (Baileys session data)
+auth_state/
+wa_auth_state/
+
 # Python
 __pycache__/
 *.py[cod]

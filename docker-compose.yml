@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: wa_sales_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wa_sales_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  whatsapp_gateway:
+    build:
+      context: ./whatsapp_gateway
+      dockerfile: Dockerfile
+    container_name: whatsapp_gateway
+    ports:
+      - "3001:3001"
+    environment:
+      - WHATSAPP_GATEWAY_AUTH_DIR=/data/auth_state
+      - PORT=3001
+      - HOST=0.0.0.0
+      - LOG_LEVEL=info
+    env_file:
+      - ./whatsapp_gateway/.env
+    volumes:
+      - wa_gateway_state:/data/auth_state
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  wa_gateway_state:
+
+networks:
+  app-network:
+    driver: bridge
